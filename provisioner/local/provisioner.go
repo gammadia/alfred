@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync"
 
 	"github.com/docker/docker/client"
 	"github.com/gammadia/alfred/scheduler"
@@ -16,7 +17,7 @@ type Provisioner struct {
 	docker *client.Client
 	fs     *fs
 
-	nextNodeNumber int
+	preparedJobs sync.Map
 }
 
 // Provisioner implements scheduler.Provisioner
@@ -36,25 +37,23 @@ func New(config Config) (*Provisioner, error) {
 		cancel: cancel,
 		docker: docker,
 		fs:     newFs(config.Workspace),
-
-		nextNodeNumber: 0,
 	}, nil
 }
 
 func (p *Provisioner) Provision(nodeName string) (scheduler.Node, error) {
-	p.nextNodeNumber += 1
-
 	ctx, cancel := context.WithCancel(p.ctx)
 
 	node := &Node{
 		name:        nodeName,
 		provisioner: p,
 
+		log:    p.config.Logger.With(slog.Group("node", "name", nodeName)),
 		ctx:    ctx,
 		cancel: cancel,
 		docker: p.docker,
+
+		preparedJobs: make(map[string]bool),
 	}
-	node.log = p.config.Logger.With(slog.Group("node", "name", nodeName))
 
 	return node, nil
 }

@@ -385,12 +385,17 @@ func (s *Scheduler) watchTaskExecution(nodeState *nodeState, slot int, task *Tas
 	task.log.Info("Running task")
 	s.broadcast(EventTaskRunning{Job: task.Job.FQN(), Task: task.Name})
 
-	if exitCode, err := node.RunTask(task, runConfig); err != nil {
-		task.log.Warn("Task failed", "error", err)
-		s.broadcast(EventTaskFailed{Job: task.Job.FQN(), Task: task.Name, ExitCode: exitCode})
+	if err := node.PrepareForTask(task); err != nil {
+		task.log.Warn("Failed to prepare node for task", "error", err)
+		s.broadcast(EventTaskFailed{Job: task.Job.FQN(), Task: task.Name, ExitCode: -1})
 	} else {
-		task.log.Info("Task completed")
-		s.broadcast(EventTaskCompleted{Job: task.Job.FQN(), Task: task.Name})
+		if exitCode, err := node.RunTask(task, runConfig); err != nil {
+			task.log.Warn("Task failed", "error", err)
+			s.broadcast(EventTaskFailed{Job: task.Job.FQN(), Task: task.Name, ExitCode: exitCode})
+		} else {
+			task.log.Info("Task completed")
+			s.broadcast(EventTaskCompleted{Job: task.Job.FQN(), Task: task.Name})
+		}
 	}
 
 	if task.Job.tasksCompleted.Add(1) == uint32(len(task.Job.Tasks)) {

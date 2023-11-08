@@ -123,8 +123,9 @@ func (p *Provisioner) Provision(nodeName string) (scheduler.Node, error) {
 	node := &Node{
 		name:        name,
 		provisioner: p,
-		server:      server,
-		log:         p.log.With(slog.Group("node", "name", name)),
+
+		log:    p.log.With(slog.Group("node", "name", name)),
+		server: server,
 	}
 
 	node.log.Info("Created server, waiting for it to become ready")

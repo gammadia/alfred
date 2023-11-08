@@ -7,21 +7,111 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"os/exec"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/docker/docker/api/types/filters"
-	"github.com/docker/docker/api/types/mount"
-
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/filters"
+	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/gammadia/alfred/proto"
 	"github.com/gammadia/alfred/scheduler"
 	"github.com/samber/lo"
+	"golang.org/x/crypto/ssh"
 )
+
+func EnsureNodeHasImage(
+	mutex *sync.Mutex,
+	log *slog.Logger,
+	docker *client.Client,
+	ssh *ssh.Client,
+	image string,
+) error {
+	mutex.Lock()
+	defer mutex.Unlock()
+
+	imageLog := log.With("image", image)
+
+	if strings.HasPrefix(image, "sha256:") {
+		return ensureNodeHasLocallyBuiltImage(imageLog, docker, ssh, image)
+	}
+
+	return ensureNodeHasImageFromRegistry(imageLog, docker, image)
+}
+
+func ensureNodeHasLocallyBuiltImage(log *slog.Logger, docker *client.Client, ssh *ssh.Client, image string) error {
+	log.Debug("Ensuring node has locally-built image")
+
+	if _, _, err := docker.ImageInspectWithRaw(context.TODO(), image); err == nil {
+		log.Debug("Image already on node")
+		return nil
+	} else if !client.IsErrNotFound(err) {
+		return fmt.Errorf("inspect image '%s': %w", image, err)
+	}
+
+	log.Info("Image not on node, loading")
+
+	session, err := ssh.NewSession()
+	if err != nil {
+		return fmt.Errorf("failed to create SSH session: %w", err)
+	}
+	defer session.Close()
+
+	saveCmd := exec.Command("/bin/bash", "-euo", "pipefail", "-c", fmt.Sprintf("docker save '%s' | zstd --compress --adapt=min=5,max=15", image))
+	saveOut := lo.Must(saveCmd.StdoutPipe())
+	session.Stdin = saveOut
+	session.Stderr = os.Stderr
+
+	if err := saveCmd.Start(); err != nil {
+		return fmt.Errorf("failed starting docker save for image '%s': %w", image, err)
+	}
+
+	if err := session.Run("zstd --decompress | docker load"); err != nil {
+		return fmt.Errorf("failed docker load for image '%s': %w", image, err)
+	}
+
+	if err := saveCmd.Wait(); err != nil {
+		return fmt.Errorf("failed docker save for iamge '%s': %w", image, err)
+	}
+
+	log.Debug("Image loaded on node")
+	return nil
+}
+
+func ensureNodeHasImageFromRegistry(log *slog.Logger, docker *client.Client, image string) error {
+	log.Debug("Ensuring node has image from registry")
+
+	ctx := context.TODO()
+	list, err := docker.ImageList(ctx, types.ImageListOptions{
+		Filters: filters.NewArgs(filters.Arg("reference", image)),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to list images: %w", err)
+	}
+
+	// We only need to check that the list is non-empty, because we filtered by reference
+	if len(list) == 0 {
+		log.Debug("Pulling image")
+		reader, err := docker.ImagePull(ctx, image, types.ImagePullOptions{})
+		if err != nil {
+			return fmt.Errorf("failed to pull image '%s': %w", image, err)
+		}
+		defer reader.Close()
+
+		// Wait for the pull to finish
+		_, _ = io.Copy(io.Discard, reader)
+
+		// We might not be handling pull error properly, but parsing the JSON response is a pain
+		// Let's just assume it worked, and if it didn't, the container create will fail
+	}
+
+	return nil
+}
 
 func RunContainer(
 	ctx context.Context,
@@ -73,36 +163,10 @@ func RunContainer(
 	serviceContainers := map[string]string{}
 
 	for _, service := range task.Job.Services {
-		serviceLog := log.With("service", service.Name)
-
 		env := lo.Map(service.Env, func(jobEnv *proto.Job_Env, _ int) string {
 			return fmt.Sprintf("%s=%s", jobEnv.Key, jobEnv.Value)
 		})
 		serviceEnv[service.Name] = env
-
-		// Make sure the image has been loaded
-		list, err := docker.ImageList(ctx, types.ImageListOptions{
-			Filters: filters.NewArgs(filters.Arg("reference", service.Image)),
-		})
-		if err != nil {
-			return -1, fmt.Errorf("failed to list docker images for service '%s': %w", service.Name, err)
-		}
-
-		// We only need to check that the list is non-empty, because we filtered by reference
-		if len(list) == 0 {
-			serviceLog.Debug("Pulling service image")
-			reader, err := docker.ImagePull(ctx, service.Image, types.ImagePullOptions{})
-			if err != nil {
-				return -1, fmt.Errorf("failed to pull docker image for service '%s': %w", service.Name, err)
-			}
-			defer reader.Close()
-
-			// Wait for the pull to finish
-			_, _ = io.Copy(io.Discard, reader)
-
-			// We might not be handling pull error properly, but parsing the JSON response is a pain
-			// Let's just assume it worked, and if it didn't, the container create will fail
-		}
 
 		resp, err := docker.ContainerCreate(
 			ctx,

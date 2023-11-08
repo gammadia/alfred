@@ -31,6 +31,7 @@ type RunTaskConfig struct {
 
 type Node interface {
 	Name() string
+	PrepareForTask(task *Task) error
 	RunTask(task *Task, config RunTaskConfig) (int, error) // TODO: we need cancellation
 	Terminate() error
 }

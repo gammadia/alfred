@@ -7,8 +7,8 @@ import (
 	"log/slog"
 	"net"
 	"os"
-	"os/exec"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -16,21 +16,22 @@ import (
 	"github.com/gammadia/alfred/provisioner/internal"
 	"github.com/gammadia/alfred/scheduler"
 	"github.com/gophercloud/gophercloud/openstack/compute/v2/servers"
-	"github.com/samber/lo"
 	"golang.org/x/crypto/ssh"
 )
 
 type Node struct {
 	name        string
 	provisioner *Provisioner
-	server      *servers.Server
-	ssh         *ssh.Client
-	docker      *client.Client
-	fs          *fs
 
-	terminated bool
+	log    *slog.Logger
+	server *servers.Server
+	ssh    *ssh.Client
+	docker *client.Client
+	fs     *fs
 
-	log   *slog.Logger
+	preparedJobs sync.Map
+	terminated   atomic.Bool
+
 	mutex sync.Mutex
 }
 
@@ -142,63 +143,40 @@ func (n *Node) connect(server *servers.Server) (err error) {
 	return nil
 }
 
-func (n *Node) RunTask(task *scheduler.Task, runConfig scheduler.RunTaskConfig) (int, error) {
+func (n *Node) PrepareForTask(task *scheduler.Task) error {
+	jobKey := task.Job.FQN()
+	log := n.log.With("job", jobKey, "task", task.Name)
+	if _, loaded := n.preparedJobs.LoadOrStore(jobKey, nil); loaded {
+		return nil
+	}
+
+	log.Debug("Prepare job for task")
+
 	for _, image := range task.Job.Steps {
-		if err := n.ensureNodeHasImage(image); err != nil {
-			return -1, fmt.Errorf("failed to ensure node has docker image '%s': %w", image, err)
+		if err := internal.EnsureNodeHasImage(&n.mutex, n.log, n.docker, n.ssh, image); err != nil {
+			return fmt.Errorf("failed to ensure node has image '%s': %w", image, err)
+		}
+	}
+	for _, service := range task.Job.Services {
+		if err := internal.EnsureNodeHasImage(&n.mutex, n.log, n.docker, n.ssh, service.Image); err != nil {
+			return fmt.Errorf("failed to ensure node has image '%s' for service '%s': %w", service.Image, service.Name, err)
 		}
 	}
 
-	return internal.RunContainer(context.TODO(), n.log, n.docker, task, n.fs, runConfig)
-}
+	log.Debug("Job prepared for task")
 
-func (n *Node) ensureNodeHasImage(image string) error {
-	n.mutex.Lock()
-	defer n.mutex.Unlock()
-
-	n.log.Debug("Ensuring node has image", "image", image)
-
-	if _, _, err := n.docker.ImageInspectWithRaw(context.Background(), image); err == nil {
-		n.log.Debug("Image already on node", "image", image)
-		return nil
-	} else if !client.IsErrNotFound(err) {
-		return fmt.Errorf("failed to inspect docker image '%s': %w", image, err)
-	}
-
-	n.log.Info("Image not on node, loading", "image", image)
-
-	session, err := n.ssh.NewSession()
-	if err != nil {
-		return fmt.Errorf("failed to create SSH session: %w", err)
-	}
-	defer session.Close()
-
-	saveCmd := exec.Command("/bin/bash", "-euo", "pipefail", "-c", fmt.Sprintf("docker save '%s' | zstd --compress --adapt=min=5,max=15", image))
-	saveOut := lo.Must(saveCmd.StdoutPipe())
-	session.Stdin = saveOut
-	session.Stderr = os.Stderr
-
-	if err := saveCmd.Start(); err != nil {
-		return fmt.Errorf("failed to 'docker save' image '%s': %w", image, err)
-	}
-
-	if err := session.Run("zstd --decompress | docker load"); err != nil {
-		return fmt.Errorf("failed to 'docker load' image '%s': %w", image, err)
-	}
-
-	if err := saveCmd.Wait(); err != nil {
-		return fmt.Errorf("failed while waiting for 'docker save' of image '%s': %w", image, err)
-	}
-
-	n.log.Debug("Image loaded on node", "image", image)
 	return nil
 }
 
+func (n *Node) RunTask(task *scheduler.Task, runConfig scheduler.RunTaskConfig) (int, error) {
+	return internal.RunContainer(context.TODO(), n.log, n.docker, task, n.fs, runConfig)
+}
+
 func (n *Node) Terminate() error {
-	if n.terminated {
+	if n.terminated.Load() == true {
 		return nil
 	}
-	n.terminated = true
+	n.terminated.Store(true)
 
 	if n.ssh != nil {
 		_ = n.ssh.Close()
